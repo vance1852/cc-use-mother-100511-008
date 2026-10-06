@@ -9,8 +9,19 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .errors import DomainError, ValidationError
+from .quota import QuotaService
 from .service import DomainService
 from .storage import Database
+
+
+def _quota(service: DomainService) -> QuotaService:
+    """复用同一数据库与审计链，惰性创建配额协调服务。"""
+
+    cached = getattr(service, "_quota_service", None)
+    if cached is None:
+        cached = QuotaService(service.database, service.clock)
+        setattr(service, "_quota_service", cached)
+    return cached
 
 
 def route(service: DomainService, method: str, path: str, body: dict[str, Any] | None,
@@ -21,6 +32,7 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
     body = body or {}
     parsed = urlparse(path)
     actor_id = headers.get("X-Actor-Id", "")
+    query = parse_qs(parsed.query)
     try:
         if method == "GET" and parsed.path == "/health":
             valid, count = service.verify_audit()
@@ -38,21 +50,84 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
             receipt = service.record_domain_data(actor_id=actor_id, **body)
             return 200 if receipt.replayed else 201, receipt.__dict__
         if method == "GET" and parsed.path == "/domain-records":
-            query = parse_qs(parsed.query)
             site_id = query.get("site_id", [""])[0]
             if not site_id:
                 raise ValidationError("site_id 不能为空")
             category = query.get("category", [None])[0]
             return 200, {"items": [item.__dict__ for item in service.list_domain_data(site_id, category)]}
         if method == "GET" and parsed.path == "/audit-events":
-            query = parse_qs(parsed.query)
             after = int(query.get("after_sequence", ["0"])[0])
             return 200, {"items": service.audit_events(after)}
+        status, payload = _route_quota(_quota(service), method, parsed.path, query,
+                                       body, actor_id)
+        if status is not None:
+            return status, payload
         return 404, {"error": "route_not_found", "message": "接口不存在"}
     except DomainError as exc:
         return exc.status, {"error": exc.code, "message": str(exc)}
     except (TypeError, ValueError) as exc:
         return 400, {"error": "invalid_request", "message": str(exc)}
+
+
+def _receipt_status(receipt) -> tuple[int, dict[str, Any]]:
+    return 200 if receipt.replayed else 201, receipt.__dict__
+
+
+def _route_quota(quota: QuotaService, method: str, path: str,
+                 query: dict[str, list[str]], body: dict[str, Any],
+                 actor_id: str) -> tuple[int | None, dict[str, Any]]:
+    """分派配额协调相关路由。"""
+
+    def q(name: str, default: str | None = None) -> str | None:
+        return query.get(name, [default])[0]
+
+    if method == "POST":
+        if path == "/teams":
+            return _receipt_status(quota.register_team(actor_id=actor_id, **body))
+        if path == "/tasks":
+            return _receipt_status(quota.register_task(actor_id=actor_id, **body))
+        if path == "/resources":
+            return _receipt_status(quota.register_resource(actor_id=actor_id, **body))
+        if path == "/resource-windows":
+            return _receipt_status(quota.declare_window(actor_id=actor_id, **body))
+        if path == "/resource-failures":
+            return _receipt_status(quota.report_resource_failure(actor_id=actor_id, **body))
+        if path == "/applications":
+            return _receipt_status(quota.request_allocation(actor_id=actor_id, **body))
+        if path == "/applications/reschedule":
+            return _receipt_status(quota.reschedule_application(actor_id=actor_id, **body))
+        if path == "/applications/cancel":
+            return _receipt_status(quota.cancel_application(actor_id=actor_id, **body))
+        if path == "/applications/start":
+            return _receipt_status(quota.mark_started(actor_id=actor_id, **body))
+        if path == "/applications/failover":
+            return _receipt_status(quota.failover_run(actor_id=actor_id, **body))
+        if path == "/recovery":
+            plan = quota.run_recovery()
+            return 200, {"plan": None if plan is None else plan.__dict__}
+        if path == "/preview/window-change":
+            return 200, quota.preview_window_change(**body)
+        if path == "/preview/cancel":
+            return 200, quota.preview_cancel(**body)
+    if method == "GET":
+        if path == "/resources":
+            return 200, {"items": [item.__dict__ for item in quota.list_resources(q("pool_id"))]}
+        if path == "/applications":
+            return 200, {"items": quota.list_applications(q("team_id"), q("status"))}
+        if path.startswith("/applications/"):
+            application_id = path.rsplit("/", 1)[1]
+            return 200, quota.get_application(application_id)
+        if path == "/quota-view":
+            resource_id = q("resource_id", "")
+            start_at = q("start_at", "")
+            end_at = q("end_at", "")
+            if not resource_id or not start_at or not end_at:
+                raise ValidationError("resource_id、start_at 与 end_at 均不能为空")
+            return 200, quota.quota_view(resource_id, start_at, end_at)
+        if path == "/plans/latest":
+            plan = quota.latest_plan()
+            return 200, {"plan": None if plan is None else plan.__dict__}
+    return None, {}
 
 
 class Handler(BaseHTTPRequestHandler):

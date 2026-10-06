@@ -63,6 +63,89 @@ CREATE TABLE IF NOT EXISTS audit_events (
     event_hash TEXT NOT NULL UNIQUE,
     occurred_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS teams (
+    team_id TEXT PRIMARY KEY,
+    organization_id TEXT NOT NULL REFERENCES organizations(organization_id),
+    name TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tasks (
+    task_id TEXT PRIMARY KEY,
+    team_id TEXT NOT NULL REFERENCES teams(team_id),
+    name TEXT NOT NULL,
+    active INTEGER NOT NULL CHECK(active IN (0, 1)),
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS resources (
+    resource_id TEXT PRIMARY KEY,
+    organization_id TEXT NOT NULL REFERENCES organizations(organization_id),
+    pool_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    active INTEGER NOT NULL CHECK(active IN (0, 1)),
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS resource_windows (
+    window_id TEXT PRIMARY KEY,
+    resource_id TEXT NOT NULL REFERENCES resources(resource_id),
+    start_slot INTEGER NOT NULL,
+    end_slot INTEGER NOT NULL,
+    capacity INTEGER NOT NULL CHECK(capacity >= 0),
+    version INTEGER NOT NULL CHECK(version >= 1),
+    superseded INTEGER NOT NULL CHECK(superseded IN (0, 1)),
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS applications (
+    application_id TEXT PRIMARY KEY,
+    organization_id TEXT NOT NULL REFERENCES organizations(organization_id),
+    team_id TEXT NOT NULL REFERENCES teams(team_id),
+    task_id TEXT NOT NULL REFERENCES tasks(task_id),
+    resource_pool TEXT NOT NULL,
+    amount INTEGER NOT NULL CHECK(amount >= 1),
+    duration_slots INTEGER NOT NULL CHECK(duration_slots >= 1),
+    earliest_slot INTEGER NOT NULL,
+    deadline_slot INTEGER NOT NULL,
+    priority TEXT NOT NULL,
+    committed INTEGER NOT NULL CHECK(committed IN (0, 1)),
+    preferred_resource_id TEXT,
+    status TEXT NOT NULL,
+    sequence INTEGER NOT NULL UNIQUE,
+    continuation_of TEXT,
+    request_id TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK(deadline_slot - earliest_slot >= duration_slots)
+);
+CREATE TABLE IF NOT EXISTS plan_versions (
+    plan_id TEXT PRIMARY KEY,
+    fingerprint TEXT NOT NULL,
+    rules_version TEXT NOT NULL,
+    current_slot INTEGER NOT NULL,
+    decisions_json TEXT NOT NULL,
+    confirmed INTEGER NOT NULL,
+    waitlisted INTEGER NOT NULL,
+    recovered INTEGER NOT NULL CHECK(recovered IN (0, 1)),
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS allocations (
+    allocation_id TEXT PRIMARY KEY,
+    application_id TEXT NOT NULL REFERENCES applications(application_id),
+    plan_id TEXT NOT NULL REFERENCES plan_versions(plan_id),
+    resource_id TEXT NOT NULL REFERENCES resources(resource_id),
+    start_slot INTEGER NOT NULL,
+    end_slot INTEGER NOT NULL,
+    amount INTEGER NOT NULL CHECK(amount >= 1),
+    status TEXT NOT NULL,
+    sealed_at TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS allocations_one_active
+    ON allocations(application_id) WHERE status != 'superseded';
+CREATE INDEX IF NOT EXISTS allocations_resource_time
+    ON allocations(resource_id, start_slot, end_slot);
+CREATE INDEX IF NOT EXISTS windows_resource_lookup
+    ON resource_windows(resource_id, superseded, start_slot, end_slot);
 """
 
 

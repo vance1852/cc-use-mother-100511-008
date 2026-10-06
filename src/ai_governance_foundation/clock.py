@@ -34,3 +34,10 @@ class FixedClock:
         """返回固定的 UTC 时间。"""
 
         return self._value
+
+    def set_to(self, value: datetime) -> None:
+        """把固定时钟推进到新的带时区时刻。"""
+
+        if value.tzinfo is None:
+            raise ValueError("固定时间必须包含时区")
+        self._value = value.astimezone(timezone.utc)
