@@ -33,3 +33,16 @@ class ConflictError(DomainError):
 
     code = "conflict"
     status = 409
+
+
+class StateConflictError(ConflictError):
+    """业务对象当前状态不允许该动作（如回写已开始的运行）。"""
+
+    code = "state_conflict"
+
+
+class UnprocessableError(DomainError):
+    """请求结构有效，但按冻结规则无法产生可行方案。"""
+
+    code = "unprocessable"
+    status = 422

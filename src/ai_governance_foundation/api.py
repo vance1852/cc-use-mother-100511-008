@@ -9,12 +9,14 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .errors import DomainError, ValidationError
+from .quota_service import QuotaService
 from .service import DomainService
 from .storage import Database
 
 
 def route(service: DomainService, method: str, path: str, body: dict[str, Any] | None,
-          headers: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:
+          headers: dict[str, str] | None = None,
+          quota: QuotaService | None = None) -> tuple[int, dict[str, Any]]:
     """把一个 HTTP 语义请求分派到领域服务。"""
 
     headers = headers or {}
@@ -48,6 +50,10 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
             query = parse_qs(parsed.query)
             after = int(query.get("after_sequence", ["0"])[0])
             return 200, {"items": service.audit_events(after)}
+        if quota is not None:
+            status, payload = _route_quota(quota, method, parsed, body, actor_id)
+            if status is not None:
+                return status, payload
         return 404, {"error": "route_not_found", "message": "接口不存在"}
     except DomainError as exc:
         return exc.status, {"error": exc.code, "message": str(exc)}
@@ -55,10 +61,51 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
         return 400, {"error": "invalid_request", "message": str(exc)}
 
 
+_QUOTA_WRITES = {
+    "/teams": "register_team",
+    "/tasks": "register_task",
+    "/resource-windows": "register_window",
+    "/resource-windows/update": "update_window",
+    "/priority-commitments": "set_priority_commitment",
+    "/quota-applications": "apply_quota",
+    "/quota-confirm": "confirm_quota",
+    "/quota-reschedule": "reschedule_quota",
+    "/quota-cancel": "cancel_quota",
+    "/runs/start": "start_run",
+    "/runs/complete": "complete_run",
+}
+
+
+def _route_quota(quota: QuotaService, method: str, parsed, body: dict[str, Any],
+                 actor_id: str) -> tuple[int | None, dict[str, Any]]:
+    if method == "POST" and parsed.path == "/impact-analysis":
+        return 200, quota.impact_analysis(**body)
+    if method == "POST" and parsed.path in _QUOTA_WRITES:
+        result = getattr(quota, _QUOTA_WRITES[parsed.path])(actor_id=actor_id, **body)
+        replayed = bool(result.get("replayed", False))
+        return (200 if replayed else 201), result
+    if method == "POST" and parsed.path == "/quota/recover":
+        return 200, quota.recover_pending()
+    if method == "GET" and parsed.path == "/quota-application":
+        query = parse_qs(parsed.query)
+        application_id = query.get("application_id", [""])[0]
+        if not application_id:
+            raise ValidationError("application_id 不能为空")
+        return 200, quota.get_quota(application_id)
+    if method == "GET" and parsed.path == "/window-quota":
+        query = parse_qs(parsed.query)
+        window_id = query.get("window_id", [""])[0]
+        if not window_id:
+            raise ValidationError("window_id 不能为空")
+        return 200, quota.window_quota(window_id)
+    return None, {}
+
+
 class Handler(BaseHTTPRequestHandler):
     """把标准库 HTTP 请求转换为路由调用。"""
 
     service: DomainService
+    quota: QuotaService
 
     def _handle(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
@@ -69,7 +116,8 @@ class Handler(BaseHTTPRequestHandler):
             self._write(400, {"error": "invalid_json", "message": "请求体必须是 UTF-8 JSON"})
             return
         status, payload = route(self.service, self.command, self.path, body,
-                                {"X-Actor-Id": self.headers.get("X-Actor-Id", "")})
+                                {"X-Actor-Id": self.headers.get("X-Actor-Id", "")},
+                                quota=self.quota)
         self._write(status, payload)
 
     def _write(self, status: int, payload: dict[str, Any]) -> None:
@@ -99,7 +147,12 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args()
     database = Database(args.database)
-    Handler.service = DomainService(database)
+    service = DomainService(database)
+    Handler.service = service
+    quota = QuotaService(database)
+    Handler.quota = quota
+    # 服务恢复后继续处理待确认申请并清理过期持有。
+    quota.recover_pending()
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     try:
         server.serve_forever()
